@@ -1,0 +1,342 @@
+"""Admin CLI - Manage copy trading system"""
+import click
+import csv
+from datetime import datetime
+from cryptography.fernet import Fernet
+from eth_account import Account
+from models import get_db, Follower, Follow, Trade, CopyOrder
+from py_clob_client.client import ClobClient
+import config
+
+cipher = Fernet(config.ENCRYPTION_KEY.encode())
+
+@click.group()
+def cli():
+    """Polymarket Copy Trading Admin Tool"""
+    pass
+
+@cli.command()
+@click.option('--name', required=True)
+@click.option('--email', required=True)
+@click.option('--private-key', required=True, help='User\'s Polymarket wallet private key')
+def add_follower(name, email, private_key):
+    """Add a new follower by encrypting their private key and storing their wallet details"""
+    db = get_db()
+    try:
+        if db.query(Follower).filter(Follower.email == email).first():
+            print(f"Error: Email {email} already exists")
+            return
+        
+        try:
+            if private_key.startswith('0x'):
+                private_key = private_key[2:]
+            
+            account = Account.from_key(private_key)
+            wallet_address = account.address
+        except Exception as e:
+            print(f"Error: Invalid private key - {e}")
+            return
+        
+        existing_wallet = db.query(Follower).filter(
+            Follower.wallet_address == wallet_address
+        ).first()
+        if existing_wallet:
+            print(f"Error: Wallet {wallet_address} already registered")
+            return
+        
+        encrypted_key = cipher.encrypt(private_key.encode()).decode()
+        
+        follower = Follower(
+            name=name,
+            email=email,
+            wallet_address=wallet_address,
+            encrypted_private_key=encrypted_key
+        )
+        
+        db.add(follower)
+        db.commit()
+        
+        print(f"\n✓ Follower added")
+        print(f"Name: {name}")
+        print(f"Email: {email}")
+        print(f"Wallet: {wallet_address}")
+        print(f"\n✓ Using their existing Polymarket wallet\n")
+        
+    finally:
+        db.close()
+
+@cli.command()
+@click.option('--wallet', required=True, help='Follower wallet address')
+def auth_follower(wallet):
+    """Derive and store Polymarket L2 API keys (Key, Secret, Passphrase) from the private key"""
+    db = get_db()
+    try:
+        follower = db.query(Follower).filter(Follower.wallet_address == wallet).first()
+        if not follower:
+            print(f"Error: Follower {wallet} not found")
+            return
+        
+        print(f"Deriving API keys for {follower.name}...")
+        
+        private_key = cipher.decrypt(follower.encrypted_private_key.encode()).decode()
+        
+        pk = private_key if not private_key.startswith('0x') else private_key[2:]
+        
+        client = ClobClient(
+            host=config.CLOB_API_URL,
+            key=pk,
+            chain_id=137 
+        )
+        
+        try:
+            creds = client.create_or_derive_api_creds()
+            
+            # Encrypt and save the L2 triplet
+            follower.encrypted_api_key = cipher.encrypt(creds.api_key.encode()).decode()
+            follower.encrypted_api_secret = cipher.encrypt(creds.api_secret.encode()).decode()
+            follower.encrypted_api_passphrase = cipher.encrypt(creds.api_passphrase.encode()).decode()
+            
+            db.commit()
+            
+            print(f"\n✓ API Keys derived and stored securely")
+            print(f"API Key: {creds.api_key[:8]}...")
+            print(f"Passphrase: {'*' * 8}\n")
+            
+        except Exception as e:
+            print(f"Error deriving keys: {e}")
+    finally:
+        db.close()
+
+@cli.command()
+@click.option('--wallet', required=True)
+@click.option('--follow', required=True, help='Trader address to follow')
+@click.option('--copy-pct', type=float, default=10.0)
+@click.option('--max-trade', type=float, default=100.0)
+@click.option('--slippage', type=float, default=2.0)
+def add_follow(wallet, follow, copy_pct, max_trade, slippage):
+    """Add a follow relationship"""
+    db = get_db()
+    try:
+        follower = db.query(Follower).filter(Follower.wallet_address == wallet).first()
+        if not follower:
+            print(f"Error: Follower {wallet} not found")
+            return
+        
+        existing = db.query(Follow).filter(
+            Follow.follower_id == follower.id,
+            Follow.trader_address == follow.lower()
+        ).first()
+        
+        if existing:
+            if existing.active:
+                print(f"Already following {follow}")
+            else:
+                existing.active = True
+                existing.copy_percentage = copy_pct
+                existing.max_trade_usd = max_trade
+                existing.max_slippage_pct = slippage
+                db.commit()
+                print(f"\n✓ Reactivated follow for {follow[:8]}...\n")
+            return
+        
+        follow_record = Follow(
+            follower_id=follower.id,
+            trader_address=follow.lower(),
+            copy_percentage=copy_pct,
+            max_trade_usd=max_trade,
+            max_slippage_pct=slippage,
+            active=True
+        )
+        
+        db.add(follow_record)
+        db.commit()
+        
+        print(f"\n✓ {follower.name} now following {follow[:8]}...")
+        print(f"Copy: {copy_pct}% | Max: ${max_trade} | Slippage: {slippage}%\n")
+        
+    finally:
+        db.close()
+
+
+@cli.command()
+@click.option('--wallet', required=True)
+@click.option('--trader', required=True)
+def remove_follow(wallet, trader):
+    """Remove a follow relationship"""
+    db = get_db()
+    try:
+        follower = db.query(Follower).filter(Follower.wallet_address == wallet).first()
+        if not follower:
+            print(f"Error: Follower {wallet} not found")
+            return
+        
+        follow = db.query(Follow).filter(
+            Follow.follower_id == follower.id,
+            Follow.trader_address == trader.lower()
+        ).first()
+        
+        if not follow:
+            print(f"Not following {trader}")
+            return
+        
+        follow.active = False
+        db.commit()
+        
+        print(f"\n✓ Stopped following {trader[:8]}...\n")
+        
+    finally:
+        db.close()
+
+@cli.command()
+def list_followers():
+    """List all followers"""
+    db = get_db()
+    try:
+        followers = db.query(Follower).all()
+        
+        if not followers:
+            print("\nNo followers found\n")
+            return
+        
+        print(f"\n{'ID':<5} {'Name':<20} {'Email':<25} {'Wallet':<12} {'Follows':<8} {'Auth':<5}")
+        print("-" * 85)
+        
+        for f in followers:
+            follows_count = db.query(Follow).filter(
+                Follow.follower_id == f.id,
+                Follow.active == True
+            ).count()
+            
+            auth_status = "✓" if f.encrypted_api_key else "✗"
+            
+            print(f"{f.id:<5} {f.name:<20} {f.email:<25} {f.wallet_address[:10]:<12} {follows_count:<8} {auth_status:<5}")
+        
+        print()
+        
+    finally:
+        db.close()
+
+
+@cli.command()
+@click.option('--wallet', required=True)
+@click.option('--limit', default=50)
+def trades(wallet, limit):
+    """View recent copy trades"""
+    db = get_db()
+    try:
+        follower = db.query(Follower).filter(Follower.wallet_address == wallet).first()
+        if not follower:
+            print(f"Error: Follower {wallet} not found")
+            return
+        
+        orders = db.query(CopyOrder, Trade).join(
+            Trade, CopyOrder.original_trade_id == Trade.id
+        ).filter(
+            CopyOrder.follower_id == follower.id
+        ).order_by(CopyOrder.created_at.desc()).limit(limit).all()
+        
+        if not orders:
+            print(f"\nNo trades found for {follower.name}\n")
+            return
+        
+        print(f"\nRecent trades for {follower.name}:\n")
+        print(f"{'Date':<12} {'Market':<40} {'Side':<5} {'Size':<8} {'Price':<8} {'Status':<10}")
+        print("-" * 90)
+        
+        for order, trade in orders:
+            date = order.created_at.strftime('%m/%d %H:%M')
+            market = trade.market_question[:37] + '...' if len(trade.market_question) > 40 else trade.market_question
+            price = f"{order.filled_price:.3f}" if order.filled_price else "N/A"
+            
+            print(f"{date:<12} {market:<40} {trade.side:<5} {order.size:<8.2f} {price:<8} {order.status:<10}")
+        
+        print()
+        
+    finally:
+        db.close()
+
+
+@cli.command()
+@click.option('--wallet', required=True)
+@click.option('--start', help='Start date (YYYY-MM-DD)')
+@click.option('--end', help='End date (YYYY-MM-DD)')
+def report(wallet, start, end):
+    """Generate P&L report"""
+    db = get_db()
+    try:
+        follower = db.query(Follower).filter(Follower.wallet_address == wallet).first()
+        if not follower:
+            print(f"Error: Follower {wallet} not found")
+            return
+        
+        query = db.query(CopyOrder, Trade).join(
+            Trade, CopyOrder.original_trade_id == Trade.id
+        ).filter(CopyOrder.follower_id == follower.id)
+        
+        if start:
+            start_date = datetime.strptime(start, '%Y-%m-%d')
+            query = query.filter(CopyOrder.created_at >= start_date)
+        
+        if end:
+            end_date = datetime.strptime(end, '%Y-%m-%d')
+            query = query.filter(CopyOrder.created_at <= end_date)
+        
+        orders = query.all()
+        
+        total = len(orders)
+        filled = len([o for o, t in orders if o.status == 'filled'])
+        failed = len([o for o, t in orders if o.status == 'failed'])
+        skipped = len([o for o, t in orders if o.status == 'skipped'])
+        
+        print(f"\n📊 Report for {follower.name}")
+        print(f"Period: {start or 'inception'} to {end or 'now'}")
+        print(f"\nTotal orders: {total}")
+        print(f"  Filled: {filled}")
+        print(f"  Failed: {failed}")
+        print(f"  Skipped: {skipped}")
+        
+        filename = f"report_{wallet[:8]}_{datetime.now().strftime('%Y%m%d')}.csv"
+        
+        with open(filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Date', 'Market', 'Side', 'Size', 'Price', 'Status'])
+            
+            for order, trade in orders:
+                writer.writerow([
+                    order.created_at.strftime('%Y-%m-%d %H:%M'),
+                    trade.market_question,
+                    trade.side,
+                    order.size,
+                    order.filled_price or 'N/A',
+                    order.status
+                ])
+        
+        print(f"\n✓ Report saved to {filename}\n")
+        
+    finally:
+        db.close()
+
+
+@cli.command()
+def stats():
+    """Show system statistics"""
+    db = get_db()
+    try:
+        total_followers = db.query(Follower).count()
+        active_follows = db.query(Follow).filter(Follow.active == True).count()
+        total_orders = db.query(CopyOrder).count()
+        filled = db.query(CopyOrder).filter(CopyOrder.status == 'filled').count()
+        
+        print(f"\n📊 System Statistics")
+        print(f"\nFollowers: {total_followers}")
+        print(f"Active follows: {active_follows}")
+        print(f"Total orders: {total_orders}")
+        print(f"Filled orders: {filled}")
+        print()
+        
+    finally:
+        db.close()
+
+
+if __name__ == '__main__':
+    cli()
